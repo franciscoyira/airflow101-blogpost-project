@@ -1,10 +1,16 @@
+# standard library imports
+from datetime import datetime, timedelta
+
+# related third party imports
+import boto3
+from pandas import read_csv, concat, pivot_table, to_datetime
+from s3fs import S3FileSystem
+
+# local application/library specific imports
 from airflow import DAG
 from airflow.models import DagRun
-from airflow.operators.python_operator import PythonOperator
-from datetime import datetime, timedelta
-from s3fs import S3FileSystem
-from pandas import read_csv, concat
-import boto3
+from airflow.operators.dummy import DummyOperator
+from airflow.operators.python_operator import BranchPythonOperator, PythonOperator
 
 default_args = {
     'owner': 'airflow',
@@ -25,7 +31,7 @@ dag = DAG(
     schedule="@weekly"
 )
 
-def read_new_files_from_bucket():
+def read_combines_new_files_from_s3(**kwargs):
     # Create a boto3 session to interact with S3/AWS
     session = boto3.Session()
     s3 = session.client('s3')
@@ -35,6 +41,7 @@ def read_new_files_from_bucket():
     # this returns a dict (within a list) with the names and properties of
     # the objects in our bucket
 
+    # Get the date of the last dag run
     # It's [-2] because [-1] is the current dag run
     last_dag_run = DagRun.find(dag_id='copy_latest_file_from_s3')[-2]
     last_dag_run_date = last_dag_run.execution_date
@@ -43,6 +50,7 @@ def read_new_files_from_bucket():
     # For the objects that are more recent than the last dag run date,
     # reads them (using read_csv) and combines in them in a pandas dataframe
     dfs = []
+    df_combined = None
     for obj in objects:
         print('Last modified object: ', obj['LastModified'])
         if obj['LastModified'] > last_dag_run_date:
@@ -51,17 +59,94 @@ def read_new_files_from_bucket():
     if len(dfs) > 0:
         df_combined = concat(dfs, axis=0)
 
-        # S3 key for the file that informs the date
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        key = f'processed_{date_str}.csv'
+    return df_combined
 
-        # write df_combined as CSV on the S3 bucket
-        s3.put_object(
-            Body=df_combined.to_csv(),
-            Bucket='processed-pomodoro-sessions',
-            Key=key)
+def branch_function(**kwargs):
+  ti = kwargs['ti']
+  # get the dataframe from xcom
+  df = ti.xcom_pull(task_ids='read_combines_new_files_from_s3')
+  # check if the dataframe is None
+  if df is None:
+    # return the task_id of the end task to skip the downstream tasks
+    return 'end_task'
+  else:
+    # return the task_id of the next task to execute
+    return 'pivoting_df'
 
-t1 = PythonOperator(
+
+def pivoting_df(**kwargs):
+    ti = kwargs['ti']
+    df = ti.xcom_pull(task_ids='read_combines_new_files_from_s3')
+
+    df = df.drop('End date', axis=1)
+
+    # Converting the column 'Start date' to date
+    df['Start date'] = df['Start date'].str[:10]
+
+    df['Start date'] = to_datetime(
+        df['Start date'],
+        format='%Y-%m-%d').dt.date
+
+    df_pivoted = pivot_table(
+       data=df,
+       values="Duration (in minutes)",
+       index="Start date",
+       columns="Project",
+       fill_value= 0
+    )
+
+    return df_pivoted
+
+def write_to_final_destination(**kwargs):
+    ti = kwargs['ti']
+    # Create a boto3 session to interact with S3/AWS
+    session = boto3.Session()
+    s3 = session.client('s3')
+   
+    # S3 key for the file that informs the date
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    key = f'processed_{date_str}.csv'
+
+    # write df_combined as CSV on the S3 bucket
+    df = ti.xcom_pull(task_ids='pivoting_df')
+    s3.put_object(
+       Body=df.to_csv(),
+       Bucket='processed-pomodoro-sessions',
+       Key=key)
+
+read_combines_new_files_from_s3 = PythonOperator(
         task_id='copy_latest_file_from_s3',
-        python_callable=read_new_files_from_bucket,
+        python_callable=read_combines_new_files_from_s3,
         dag=dag)
+
+branch_task = BranchPythonOperator(
+  task_id='branch_task',
+  python_callable=branch_function,
+  provide_context=True,
+  dag=dag
+)
+
+pivoting_df = PythonOperator(
+  task_id='pivoting_df',
+  python_callable=pivoting_df,
+  provide_context=True,
+  dag=dag
+)
+
+write_to_final_destination = PythonOperator(
+    task_id='write_to_final_destination',
+    python_callable=write_to_final_destination,
+    provide_context=True,
+    dag=dag
+)
+
+# define the end_task as a DummyOperator
+end_task = DummyOperator(
+  task_id='end_task',
+  dag=dag
+)
+
+# set the dependencies
+read_combines_new_files_from_s3 >> branch_task
+branch_task >> pivoting_df >> write_to_final_destination
+branch_task >> end_task
