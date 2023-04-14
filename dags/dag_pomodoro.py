@@ -115,7 +115,7 @@ def write_to_final_destination(**kwargs):
        Key=key)
 
 read_combines_new_files_from_s3 = PythonOperator(
-        task_id='copy_latest_file_from_s3',
+        task_id='read_combines_new_files_from_s3',
         python_callable=read_combines_new_files_from_s3,
         dag=dag)
 
