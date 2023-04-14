@@ -25,7 +25,7 @@ default_args = {
 
 # Instantiate the DAG
 dag = DAG(
-    dag_id='copy_latest_file_from_s3',
+    dag_id='etl-pomodoro',
     default_args=default_args,
     # this means the DAG will run every day at the same time as start date
     schedule="@weekly"
