@@ -11,6 +11,7 @@ from airflow import DAG
 from airflow.models import DagRun
 from airflow.operators.dummy import DummyOperator
 from airflow.operators.python_operator import BranchPythonOperator, PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
 
 default_args = {
     'owner': 'airflow',
@@ -95,24 +96,61 @@ def pivoting_df(**kwargs):
        fill_value= 0
     )
 
+    # Rename columns
+    df_pivoted = df_pivoted.rename(
+       columns={'Learning': 'learning_minutes',
+                'Work': 'work_minutes'}
+       )
+
     return df_pivoted
 
-def write_to_final_destination(**kwargs):
-    ti = kwargs['ti']
-    # Create a boto3 session to interact with S3/AWS
-    session = boto3.Session()
-    s3 = session.client('s3')
-   
-    # S3 key for the file that informs the date
-    date_str = datetime.now().strftime('%Y-%m-%d')
-    key = f'processed_{date_str}.csv'
+# Define the function that performs the upsert
+def upsert_df_to_rds(**kwargs):
+    # Get the dataframe from the previous task using xcom
+    df = kwargs['ti'].xcom_pull(task_ids='pivoting_df')
+    
+    # Get the RDS connection using PostgresHook
+    rds_hook = PostgresHook(postgres_conn_id='database-airflow-blogpost')
+    
+    # Get the table name and schema from the parameters
+    table = kwargs['params']['table']
+    schema = kwargs['params']['schema']
+    
+    # Create a temporary table with the same structure as the target table
+    rds_hook.run(f"CREATE TEMPORARY TABLE tmp_{table} (LIKE {schema}.{table});")
+    
+    # Insert the dataframe into the temporary table using to_sql method
+    df.to_sql(
+       f"tmp_{table}",
+       rds_hook.get_sqlalchemy_engine(),
+       schema=schema,
+       if_exists='replace',
+       index=True,
+       index_label='date')
+    
+    # Perform the upsert by merging the temporary table with the target table on the date column
+    rds_hook.run(f"""
+        INSERT INTO {schema}.{table}
+        SELECT * FROM tmp_{table}
+        ON CONFLICT (date) DO UPDATE SET
+        work_minutes = EXCLUDED.work_minutes,
+        learning_minutes = EXCLUDED.learning_minutes;
+    """)
+    
+    # Drop the temporary table
+    rds_hook.run(f"DROP TABLE tmp_{table};")
 
-    # write df_combined as CSV on the S3 bucket
-    df = ti.xcom_pull(task_ids='pivoting_df')
-    s3.put_object(
-       Body=df.to_csv(),
-       Bucket='processed-pomodoro-sessions',
-       Key=key)
+# Define the task that performs the upsert using PythonOperator
+upsert_task = PythonOperator(
+    task_id='upsert_df_to_rds',
+    python_callable=upsert_df_to_rds,
+    params={
+        'table': 'pomodoro_day_catg',
+        'schema': 'public'
+    },
+    provide_context=True,
+    dag=dag,
+)
 
 read_combines_new_files_from_s3 = PythonOperator(
         task_id='read_combines_new_files_from_s3',
@@ -133,13 +171,6 @@ pivoting_df = PythonOperator(
   dag=dag
 )
 
-write_to_final_destination = PythonOperator(
-    task_id='write_to_final_destination',
-    python_callable=write_to_final_destination,
-    provide_context=True,
-    dag=dag
-)
-
 # define the end_task as a DummyOperator
 end_task = DummyOperator(
   task_id='end_task',
@@ -148,5 +179,5 @@ end_task = DummyOperator(
 
 # set the dependencies
 read_combines_new_files_from_s3 >> branch_task
-branch_task >> pivoting_df >> write_to_final_destination
+branch_task >> pivoting_df >> upsert_task
 branch_task >> end_task
